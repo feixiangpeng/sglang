@@ -81,7 +81,10 @@ from sglang.srt.mem_cache.unified_cache.components import (
 from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
     UnifiedSessionRefTracker,
 )
-from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
+from sglang.srt.mem_cache.unified_cache.storage_attachment import (
+    StorageAttachment,
+    should_log_storage_hit_drop,
+)
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
     create_tree_core,
     select_tree_core_backend,
@@ -407,6 +410,8 @@ class UnifiedRadixCache(BasePrefixCache):
             CacheRequestHandle, int
         ] = {}
         self.storage_prefetch_retries = StoragePrefetchRetries()
+        # Storage hits dropped because the host tier could not stage them (#38452).
+        self._storage_hit_host_capacity_drops = 0
         self.ongoing_backup: dict[int, tuple[NodeId, DecLockRefParams]] = {}
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.reset()
@@ -2572,6 +2577,37 @@ class UnifiedRadixCache(BasePrefixCache):
         self.revoke_pending_prefetch(request)
         self.storage_prefetch_retries.refetch(request.rid, storage_hit_end)
 
+    def _warn_storage_hit_host_capacity(
+        self, request: CacheRequestHandle, hit_tokens: int
+    ) -> None:
+        """A storage hit was found but the host tier could not stage it (#38452).
+
+        Rate limited: the first three drops and then every hundredth. The usual cause
+        is a host pool that is not larger than the device pool under write-through, so
+        the host tier holds only copies of device-resident KV that eviction never frees.
+        """
+        self._storage_hit_host_capacity_drops += 1
+        count = self._storage_hit_host_capacity_drops
+        if not should_log_storage_hit_drop(count):
+            return
+        host_pool = self.cache_controller.mem_pool_host
+        allocator = self.token_to_kv_pool_allocator
+        logger.warning(
+            "HiCache storage hit of %d tokens for req=%s dropped (host_capacity): the "
+            "host KV pool has %d of %d tokens free and host eviction could not free "
+            "the rest. This happens when the host tier holds only copies of "
+            "device-resident KV (device pool: %d tokens), which write-through never "
+            "evicts. Increase --hicache-ratio or --hicache-size so the host pool "
+            "exceeds the device pool by the prompts you expect to recall from "
+            "storage. %d such drops so far.",
+            hit_tokens,
+            request.rid,
+            host_pool.available_size(),
+            host_pool.logical_size,
+            getattr(allocator, "size_full", None) or allocator.size,
+            count,
+        )
+
     def _log_storage_prefetch_deferred(self, num_tokens: int, reason: str) -> None:
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.log_storage_prefetch_deferred_tokens(
@@ -2938,6 +2974,7 @@ class UnifiedRadixCache(BasePrefixCache):
                         max(alloc_len, aux_hit_tokens), "host_capacity"
                     )
                     return False
+                self._warn_storage_hit_host_capacity(request, hit_tokens)
                 self._finish_storage_prefetch(
                     request, fulfilled_tokens=0, reason="host_capacity"
                 )

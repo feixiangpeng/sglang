@@ -32,6 +32,12 @@ Notes:
 
 ## Key Configurations with Storage Backends Enabled
 
+### Host Pool Size With a Storage Backend
+
+A storage (L3) hit is staged in the host pool before it is loaded to the device, so the host tier must have room for it at the moment of the hit. With `write_through` (the default) every device-resident token also keeps a host copy, and host eviction frees only entries whose device copy is gone. Once the device pool is full, the host pool can therefore offer a storage hit at most `host_tokens - device_tokens` tokens. If the host pool is not larger than the device pool, every L3 hit is dropped once the server has warmed up: `cached_tokens` stays 0, `sglang:storage_prefetch_unfulfilled_tokens_total{reason="host_capacity"}` grows, and the same prompt is served from storage only after `/flush_cache` empties the host pool.
+
+Size the host pool above the device pool by at least the prompts you expect to recall from storage. `--hicache-ratio 2` (the default) does this; `--hicache-size` must be checked against the device pool reported at startup (`KV Cache is allocated ... #tokens`). The server warns at storage attach when the headroom is below the prefetch threshold, and logs the first dropped hits.
+
 ### Memory Layout Optimization
 
 ```bash Command

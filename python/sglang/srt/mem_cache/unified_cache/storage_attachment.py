@@ -36,6 +36,54 @@ _PREFETCH_POLICIES = ("best_effort", "wait_complete", "timeout")
 _WRITE_POLICIES = ("write_back", "write_through", "write_through_selective")
 
 
+def storage_staging_headroom_warning(
+    *,
+    storage_backend: Optional[str],
+    host_tokens: int,
+    device_tokens: int,
+    prefetch_threshold: int,
+    write_policy: str,
+    host_memory_mode: str,
+) -> Optional[str]:
+    """Warn when the host tier can never stage a storage (L3) hit once the device pool is full.
+
+    A storage hit lands on host first and is loaded to the device from there. With a
+    write-through policy every device-resident token keeps a host copy, and host eviction
+    frees only host-only entries (the device copy of a duplicate is not a reason to drop
+    its host copy). So once the device pool is full, the host tier can offer a storage hit
+    at most ``host_tokens - device_tokens`` tokens. Below ``prefetch_threshold`` no hit can
+    be staged and every hit is dropped as ``host_capacity`` (#38452). write_back reclaims
+    host duplicates and buffer-only mode stages outside the tree, so neither is affected.
+    """
+    if host_memory_mode != "cache" or write_policy == "write_back":
+        return None
+    headroom = host_tokens - device_tokens
+    if headroom >= prefetch_threshold:
+        return None
+    if headroom < 0:
+        comparison = f"is {-headroom} tokens smaller than the device pool ({device_tokens} tokens)"
+    else:
+        comparison = (
+            f"exceeds the device pool ({device_tokens} tokens) by only {headroom} tokens, "
+            f"below the {prefetch_threshold}-token storage prefetch threshold"
+        )
+    return (
+        f"HiCache storage backend {storage_backend!r} is attached, but the host KV pool "
+        f"({host_tokens} tokens) {comparison}. "
+        f"Under {write_policy} every device-resident token keeps a host copy "
+        "and host eviction frees only host-only entries, so once the device pool is full "
+        "no storage (L3) hit can be staged on host: every hit is dropped as host_capacity "
+        '(sglang:storage_prefetch_unfulfilled_tokens_total{reason="host_capacity"}). '
+        "Size the host pool above the device pool by at least the prompts you expect to "
+        "recall from storage (--hicache-ratio or --hicache-size)."
+    )
+
+
+def should_log_storage_hit_drop(count: int) -> bool:
+    """Log the first three host_capacity drops, then every hundredth."""
+    return count <= 3 or count % 100 == 0
+
+
 class StorageAttachment:
     """Attach / detach the storage backend of one ``UnifiedRadixCache``."""
 
@@ -274,6 +322,9 @@ class StorageAttachment:
                     "Hashed %d radix nodes that predate the storage backend.", filled
                 )
 
+        if enable_storage and not cache.enable_storage:
+            self._warn_storage_staging_headroom(storage_backend, prefetch_threshold)
+
         cache.enable_storage = enable_storage
         cache.prefetch_threshold = prefetch_threshold
         cache.prefetch_timeout_base = prefetch_timeout_base
@@ -289,6 +340,25 @@ class StorageAttachment:
             )
         else:
             cache.storage_metrics_collector = None
+
+    def _warn_storage_staging_headroom(
+        self, storage_backend: Optional[str], prefetch_threshold: int
+    ) -> None:
+        """One warning at storage enable when L3 hits cannot be staged under pressure."""
+        cache = self._cache
+        controller = cache.cache_controller
+        host_pool = controller.mem_pool_host
+        allocator = cache.token_to_kv_pool_allocator
+        message = storage_staging_headroom_warning(
+            storage_backend=storage_backend,
+            host_tokens=int(getattr(host_pool, "logical_size", None) or host_pool.size),
+            device_tokens=int(getattr(allocator, "size_full", None) or allocator.size),
+            prefetch_threshold=prefetch_threshold,
+            write_policy=controller.write_policy,
+            host_memory_mode=cache.host_memory_mode,
+        )
+        if message is not None:
+            logger.warning(message)
 
     def resolve_prefetch_threshold(self, configured: int) -> int:
         """Use the same complete-window minimum for every buffer-mode anchor."""
