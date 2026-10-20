@@ -1564,11 +1564,19 @@ class Req(ReqDllmMixin):
         kv, self.kv = self.kv, ReqKvInfo()
         return kv
 
+    def strip_thinking_cache_bound(self, length: int) -> int:
+        """How far the tree may keep this request's sequence under
+        --strip-thinking-cache: the prompt, so thinking + answer stay
+        request-private and are freed on release (#22373), but never less than
+        the tree already protects, which a re-prefill after a retraction can
+        have pushed past the prompt (#41617)."""
+        if not (get_serving().strip_thinking_cache and self.reasoning_tokens > 0):
+            return length
+        return min(length, max(len(self.origin_input_ids), self.kv.cache_protected_len))
+
     def owned_kv_len(self) -> int:
-        # Report only the prompt prefix so thinking + answer fall into the
-        # overallocated range and are reclaimed by release_kv_cache. #22373.
         if get_serving().strip_thinking_cache and self.reasoning_tokens > 0:
-            return min(self.kv.kv_committed_len, len(self.origin_input_ids))
+            return self.strip_thinking_cache_bound(self.kv.kv_committed_len)
         if self.finished_len is None:
             return self.kv.kv_committed_len
         # A verify step commits a whole accepted chunk, so output_ids can run
